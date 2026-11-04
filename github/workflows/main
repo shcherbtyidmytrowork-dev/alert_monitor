@@ -1,0 +1,550 @@
+# -*- coding: utf-8 -*-
+"""Моніторинг тривог — Android (Kivy). Двигун: core.py (з alert_monitor_app.py)."""
+import json
+import logging
+import os
+import queue
+import re
+import sys
+from pathlib import Path
+
+
+def _data_dir() -> str:
+    try:
+        from android.storage import app_storage_path  # type: ignore
+        return app_storage_path()
+    except Exception:
+        return str(Path.home() / ".alert_monitor")
+
+
+DATA_DIR = _data_dir()
+os.makedirs(DATA_DIR, exist_ok=True)
+os.environ["ALERT_DATA_DIR"] = DATA_DIR
+
+from kivy.clock import Clock  # noqa: E402
+from kivy.core.window import Window  # noqa: E402
+from kivy.lang import Builder  # noqa: E402
+from kivy.metrics import dp  # noqa: E402
+from kivy.properties import StringProperty  # noqa: E402
+from kivy.uix.boxlayout import BoxLayout  # noqa: E402
+from kivy.uix.button import Button  # noqa: E402
+from kivy.uix.checkbox import CheckBox  # noqa: E402
+from kivy.uix.label import Label  # noqa: E402
+from kivy.uix.popup import Popup  # noqa: E402
+from kivy.uix.scrollview import ScrollView  # noqa: E402
+from kivy.uix.spinner import Spinner  # noqa: E402
+from kivy.uix.switch import Switch  # noqa: E402
+from kivy.uix.textinput import TextInput  # noqa: E402
+from kivy.app import App  # noqa: E402
+
+import core  # noqa: E402
+
+EMOJI = re.compile("[\U00010000-\U0010ffff\u2190-\u2bff\ufe0f\u200d]")
+
+
+def clean(s: str) -> str:
+    return EMOJI.sub("", str(s)).strip()
+
+
+def is_android() -> bool:
+    return "ANDROID_ARGUMENT" in os.environ
+
+
+# ---------------- Android-допоміжні функції ----------------
+def acquire_wakelock():
+    if not is_android():
+        return None
+    try:
+        from jnius import autoclass  # type: ignore
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        ctx = autoclass("android.content.Context")
+        pm = act.getSystemService(ctx.POWER_SERVICE)
+        wl = pm.newWakeLock(1, "alertmonitor:wl")  # PARTIAL_WAKE_LOCK
+        wl.acquire()
+        return wl
+    except Exception as exc:
+        logging.warning("WakeLock не отримано: %s", exc)
+        return None
+
+
+def ask_background_permission() -> None:
+    if not is_android():
+        return
+    try:
+        from jnius import autoclass  # type: ignore
+        act = autoclass("org.kivy.android.PythonActivity").mActivity
+        Intent = autoclass("android.content.Intent")
+        Settings = autoclass("android.provider.Settings")
+        Uri = autoclass("android.net.Uri")
+        intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        intent.setData(Uri.parse("package:" + act.getPackageName()))
+        act.startActivity(intent)
+    except Exception as exc:
+        logging.warning("Не вдалося відкрити налаштування батареї: %s", exc)
+
+
+def open_url(url: str) -> None:
+    try:
+        if is_android():
+            from jnius import autoclass  # type: ignore
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            act.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        else:
+            import webbrowser
+            webbrowser.open(url)
+    except Exception as exc:
+        logging.warning("Не вдалося відкрити посилання: %s", exc)
+
+
+KV = """
+<ScrollLabel>:
+    do_scroll_x: False
+    Label:
+        text: root.text
+        size_hint_y: None
+        height: max(self.texture_size[1] + dp(12), root.height)
+        text_size: self.width - dp(12), None
+        halign: 'left'
+        valign: 'top'
+
+BoxLayout:
+    orientation: 'vertical'
+    padding: dp(4)
+    spacing: dp(4)
+    Label:
+        id: lbl_state
+        text: 'ЗУПИНЕНО'
+        size_hint_y: None
+        height: dp(34)
+        bold: True
+        font_size: '18sp'
+    BoxLayout:
+        size_hint_y: None
+        height: dp(46)
+        spacing: dp(4)
+        Button:
+            text: 'Запустити'
+            on_release: app.engine.start()
+        Button:
+            text: 'Зупинити'
+            on_release: app.engine.stop()
+        Button:
+            text: 'Перезапуск'
+            on_release: app.engine.restart()
+    TabbedPanel:
+        do_default_tab: False
+        tab_width: dp(84)
+        TabbedPanelItem:
+            text: 'Статус'
+            ScrollLabel:
+                id: st_text
+        TabbedPanelItem:
+            text: 'Канали'
+            BoxLayout:
+                orientation: 'vertical'
+                ScrollView:
+                    do_scroll_x: False
+                    BoxLayout:
+                        id: ch_list
+                        orientation: 'vertical'
+                        size_hint_y: None
+                        height: self.minimum_height
+                        spacing: dp(4)
+                Button:
+                    text: '+ Додати канал'
+                    size_hint_y: None
+                    height: dp(46)
+                    on_release: app.channel_dialog(None)
+        TabbedPanelItem:
+            text: 'Події'
+            ScrollLabel:
+                id: ev_text
+        TabbedPanelItem:
+            text: 'Лог'
+            ScrollLabel:
+                id: log_text
+        TabbedPanelItem:
+            text: 'Налашт.'
+            ScrollView:
+                do_scroll_x: False
+                BoxLayout:
+                    id: set_box
+                    orientation: 'vertical'
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(6)
+                    padding: dp(6)
+        TabbedPanelItem:
+            text: 'JSON'
+            BoxLayout:
+                orientation: 'vertical'
+                TextInput:
+                    id: json_edit
+                    font_size: '12sp'
+                Button:
+                    text: 'Зберегти конфіг (JSON)'
+                    size_hint_y: None
+                    height: dp(46)
+                    on_release: app.save_json()
+"""
+
+
+class ScrollLabel(ScrollView):
+    text = StringProperty("")
+
+
+def mk_popup(title, content, size=(0.92, 0.7)):
+    return Popup(title=title, content=content, size_hint=size, auto_dismiss=False)
+
+
+class AlertApp(App):
+    title = "Alert Monitor"
+
+    def build(self):
+        self.q = queue.Queue()
+        core.load_config()
+        core.setup_logging(self.q)
+        self.engine = core.Engine(self.q)
+        self.events = []
+        self.log_lines = []
+        self.last_st = {}
+        self.qr_popup = None
+        self.qr_url = ""
+        self.wl = acquire_wakelock()
+        self.root_w = Builder.load_string(KV)
+        self.ids_ = self.root_w.ids
+        self.build_settings()
+        self.refresh_channels()
+        self.ids_.json_edit.text = json.dumps(core.CFG, ensure_ascii=False, indent=2)
+        Clock.schedule_interval(self.pump, 0.2)
+        Clock.schedule_once(self.first_start, 1.5)
+        Window.softinput_mode = "below_target"
+        return self.root_w
+
+    def on_start(self):
+        if is_android():
+            try:
+                from android.permissions import request_permissions, Permission  # type: ignore
+                request_permissions(["android.permission.POST_NOTIFICATIONS"])
+            except Exception:
+                pass
+
+    def on_pause(self):
+        return True  # не закривати у фоні
+
+    def on_stop(self):
+        try:
+            self.engine.shutdown(5)
+        except Exception:
+            pass
+
+    def first_start(self, _dt):
+        if int(core.CFG.get("api_id") or 0) > 0 and core.CFG.get("api_hash"):
+            self.engine.start()
+        else:
+            self.ids_.st_text.text = "Спочатку відкрийте вкладку «Налашт.» і введіть API ID та API Hash\n(з my.telegram.org), потім натисніть «Зберегти» і «Запустити»."
+
+    # ---------- черга двигуна ----------
+    def pump(self, _dt):
+        for _ in range(200):
+            try:
+                item = self.q.get_nowait()
+            except queue.Empty:
+                break
+            kind = item[0]
+            if kind == "log":
+                self.log_lines.append(clean(item[2]))
+                self.log_lines = self.log_lines[-300:]
+                self.ids_.log_text.text = "\n".join(reversed(self.log_lines))
+            elif kind == "status":
+                self.apply_status(item[1])
+            elif kind == "event":
+                self.events.append(item[1])
+                self.events = self.events[-200:]
+                self.render_events()
+            elif kind == "ask":
+                self.do_ask(item)
+            elif kind == "qr":
+                self.show_qr(item[1])
+            elif kind == "notify":
+                self.info(item[1], item[2])
+
+    def apply_status(self, st):
+        self.last_st = st
+        colors = {"працює": (0.12, 0.56, 0.24, 1), "зупинено": (0.6, 0.6, 0.6, 1),
+                  "помилка": (0.85, 0.2, 0.2, 1)}
+        lbl = self.ids_.lbl_state
+        lbl.text = st["engine"].upper() + (f" — {clean(st['detail'])}" if st.get("detail") else "")
+        lbl.color = colors.get(st["engine"], (0.9, 0.6, 0.1, 1))
+        c = st["counters"]
+        lines = [
+            ("ТРИВОГА: " if st["alert_active"] else "") + clean(st["alert"]),
+            ("Від: " + core.fmt_ts(st["alert_since"])) if st["alert_active"] else "",
+            "Акаунт: " + (st["account"] or "—"),
+            "",
+            f"Отримано: {c['received']}   Надіслано: {c['sent']}   Пропущено: {c['skipped']}   Помилок: {c['errors']}   У черзі: {st.get('pending', 0)}",
+            "",
+        ]
+        for comp in st["components"].values():
+            lines.append(f"• {comp['label']} {comp['where']}: {clean(comp['state'])}"
+                         + (f"  (остання: {comp['last']}, шт: {comp['count']})" if comp["count"] else ""))
+        ls = st["last_sent"]
+        if ls["time"]:
+            lines += ["", f"Останнє надіслане ({core.fmt_ts(ls['time'])}):", clean(ls["text"])]
+        self.ids_.st_text.text = "\n".join(lines)
+
+    def render_events(self):
+        rows = []
+        for ev in reversed(self.events):
+            if ev["outcome"] == "ignore":
+                continue
+            status = core.OUTCOME_TEXT.get(ev["outcome"], ev["outcome"])
+            if ev["detail"]:
+                status += f": {ev['detail']}"
+            rows.append(f"{core.fmt_ts(ev['ts'])} | {ev['source']} | {ev['kind']} | {status}\n    {clean(ev['text'])}")
+        self.ids_.ev_text.text = "\n".join(rows) or "Подій поки немає."
+
+    # ---------- діалоги ----------
+    def info(self, title, text):
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        box.add_widget(ScrollLabel(text=clean(text)))
+        ok = Button(text="OK", size_hint_y=None, height=dp(46))
+        box.add_widget(ok)
+        p = mk_popup(clean(title), box, (0.9, 0.5))
+        ok.bind(on_release=p.dismiss)
+        p.open()
+
+    def do_ask(self, item):
+        _, fut, kind, title, prompt, secret, options = item
+        if fut.cancelled():
+            return
+        done = {"v": False}
+
+        def finish(value, popup):
+            if not done["v"]:
+                done["v"] = True
+                try:
+                    fut.set_result(value)
+                except Exception:
+                    pass
+            popup.dismiss()
+
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        box.add_widget(ScrollLabel(text=clean(prompt)))
+        p = mk_popup(clean(title), box, (0.92, 0.65))
+        if kind == "choice":
+            for val, label in options:
+                b = Button(text=clean(label), size_hint_y=None, height=dp(50))
+                b.bind(on_release=lambda _b, v=val: finish(v, p))
+                box.add_widget(b)
+            cancel = Button(text="Скасувати", size_hint_y=None, height=dp(46))
+            cancel.bind(on_release=lambda _b: finish(None, p))
+            box.add_widget(cancel)
+        else:
+            ti = TextInput(multiline=False, password=bool(secret), size_hint_y=None, height=dp(44))
+            box.add_widget(ti)
+            row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+            ok = Button(text="OK")
+            cancel = Button(text="Скасувати")
+            ok.bind(on_release=lambda _b: finish(ti.text, p))
+            cancel.bind(on_release=lambda _b: finish(None, p))
+            ti.bind(on_text_validate=lambda _t: finish(ti.text, p))
+            row.add_widget(ok)
+            row.add_widget(cancel)
+            box.add_widget(row)
+            Clock.schedule_once(lambda _d: setattr(ti, "focus", True), 0.3)
+        p.open()
+
+    def show_qr(self, url):
+        if url is None:
+            if self.qr_popup:
+                self.qr_popup.dismiss()
+                self.qr_popup = None
+            return
+        self.qr_url = url
+        if self.qr_popup:
+            return
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        box.add_widget(ScrollLabel(text=(
+            "Вхід на цьому ж телефоні:\nнатисніть «Відкрити в Telegram» і підтвердіть вхід у застосунку Telegram.\n"
+            "Посилання оновлюється автоматично (кнопка завжди відкриває актуальне).")))
+        b1 = Button(text="Відкрити в Telegram", size_hint_y=None, height=dp(52))
+        b1.bind(on_release=lambda _b: open_url(self.qr_url))
+        b2 = Button(text="Скасувати вхід", size_hint_y=None, height=dp(46))
+        box.add_widget(b1)
+        box.add_widget(b2)
+        p = mk_popup("Вхід через Telegram", box, (0.92, 0.5))
+
+        def cancel(_b):
+            self.engine.cancel_login()
+            self.show_qr(None)
+        b2.bind(on_release=cancel)
+        self.qr_popup = p
+        p.open()
+
+    # ---------- канали ----------
+    def refresh_channels(self):
+        box = self.ids_.ch_list
+        box.clear_widgets()
+        for s in core.CFG["sources"]:
+            row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(4))
+            sw = Switch(active=bool(s.get("enabled", True)), size_hint_x=None, width=dp(70))
+            sw.bind(active=lambda _w, v, src=s: self.toggle_channel(src, v))
+            lbl = Label(text=f"@{s['name']}\n{core.MODE_LABELS.get(s['mode'], s['mode'])}",
+                        halign="left", valign="middle", font_size="13sp")
+            lbl.bind(size=lambda w, _s: setattr(w, "text_size", (w.width, None)))
+            eb = Button(text="Змінити", size_hint_x=None, width=dp(80))
+            eb.bind(on_release=lambda _b, src=s: self.channel_dialog(src))
+            db = Button(text="X", size_hint_x=None, width=dp(44))
+            db.bind(on_release=lambda _b, src=s: self.remove_channel(src))
+            for w in (sw, lbl, eb, db):
+                row.add_widget(w)
+            box.add_widget(row)
+
+    def persist_sources(self):
+        core.CFG["sources"] = core.normalize_sources(core.CFG["sources"])
+        core.save_config()
+        self.ids_.json_edit.text = json.dumps(core.CFG, ensure_ascii=False, indent=2)
+        self.refresh_channels()
+
+    def toggle_channel(self, src, value):
+        src["enabled"] = bool(value)
+        core.save_config()
+
+    def remove_channel(self, src):
+        core.CFG["sources"] = [s for s in core.CFG["sources"] if s is not src]
+        self.persist_sources()
+
+    def channel_dialog(self, src):
+        new = src is None
+        data = src or {"name": "", "mode": "alerts", "enabled": True, "include": [], "exclude": [],
+                       "match": "any", "send_mode": "copy", "send_media": True, "dedup": True}
+        box = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+        name = TextInput(text=data["name"], multiline=False, hint_text="імʼя каналу, напр. chernivetskaODA",
+                         size_hint_y=None, height=dp(42))
+        labels = list(core.MODE_LABELS.values())
+        mode = Spinner(text=core.MODE_LABELS[data["mode"]], values=labels, size_hint_y=None, height=dp(42))
+        inc = TextInput(text=", ".join(data.get("include", [])), hint_text="Ключові слова (через кому)")
+        exc = TextInput(text=", ".join(data.get("exclude", [])), hint_text="Стоп-слова (через кому)")
+        match = Spinner(text=core.MATCH_LABELS[data.get("match", "any")], values=list(core.MATCH_LABELS.values()),
+                        size_hint_y=None, height=dp(42))
+        smode = Spinner(text=core.SEND_LABELS[data.get("send_mode", "copy")], values=list(core.SEND_LABELS.values()),
+                        size_hint_y=None, height=dp(42), font_size="12sp")
+        flags = BoxLayout(size_hint_y=None, height=dp(40))
+        c_media = CheckBox(active=data.get("send_media", True))
+        c_dedup = CheckBox(active=data.get("dedup", True))
+        for txt, cb in (("Медіа", c_media), ("Без дублів", c_dedup)):
+            flags.add_widget(Label(text=txt))
+            flags.add_widget(cb)
+        for w in (name, mode, inc, exc, match, smode, flags):
+            box.add_widget(w)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        ok, cancel = Button(text="Зберегти"), Button(text="Скасувати")
+        row.add_widget(ok)
+        row.add_widget(cancel)
+        box.add_widget(row)
+        p = mk_popup("Канал", box, (0.96, 0.95))
+
+        def split(t):
+            return [x.strip() for x in re.split(r"[,\n]", t) if x.strip()]
+
+        def save(_b):
+            nm = core.clean_username(name.text)
+            if not nm:
+                return
+            data.update(
+                name=nm,
+                mode=next(k for k, v in core.MODE_LABELS.items() if v == mode.text),
+                include=split(inc.text), exclude=split(exc.text),
+                match=next(k for k, v in core.MATCH_LABELS.items() if v == match.text),
+                send_mode=next(k for k, v in core.SEND_LABELS.items() if v == smode.text),
+                send_media=c_media.active, dedup=c_dedup.active)
+            if new:
+                core.CFG["sources"].append(data)
+            self.persist_sources()
+            p.dismiss()
+            self.info("Збережено", "Щоб зміни застосувалися, натисніть «Перезапуск».")
+
+        ok.bind(on_release=save)
+        cancel.bind(on_release=p.dismiss)
+        p.open()
+
+    # ---------- налаштування ----------
+    def build_settings(self):
+        box = self.ids_.set_box
+        self.fields = {}
+
+        def add_text(key, label, cast=str):
+            box.add_widget(Label(text=label, size_hint_y=None, height=dp(24), halign="left"))
+            ti = TextInput(text=str(core.CFG.get(key, "")), multiline=False, size_hint_y=None, height=dp(42))
+            box.add_widget(ti)
+            self.fields[key] = (ti, cast)
+
+        def add_flag(key, label):
+            row = BoxLayout(size_hint_y=None, height=dp(40))
+            row.add_widget(Label(text=label, halign="left"))
+            cb = CheckBox(active=bool(core.CFG.get(key)), size_hint_x=None, width=dp(48))
+            row.add_widget(cb)
+            box.add_widget(row)
+            self.fields[key] = (cb, bool)
+
+        add_text("api_id", "Telegram API ID (my.telegram.org)", int)
+        add_text("api_hash", "Telegram API Hash")
+        add_text("destination", "Канал-приймач (@імʼя, ID або me)")
+        add_text("district_name", "Назва району")
+        add_text("check_interval_seconds", "Інтервал перевірки, с (0 = лише події)", int)
+        add_text("send_delay_seconds", "Затримка перед відправкою, с", int)
+        add_text("dedup_window_seconds", "Вікно дублів, с", int)
+        add_flag("include_oblast_alerts", "Обласні тривоги")
+        add_flag("auto_join_sources", "Автопідписка на канали")
+        add_flag("dedup_enabled", "Фільтр дублів")
+        add_flag("dry_run", "Тестовий режим (нічого не надсилати)")
+        for text, fn in (
+            ("Зберегти налаштування", self.save_settings),
+            ("Дозволити роботу у фоні (батарея)", lambda: ask_background_permission()),
+            ("Тестове повідомлення", lambda: self.engine.send_test()),
+            ("Скинути стан тривоги", lambda: self.engine.reset_alert()),
+            ("Вийти з акаунта Telegram", lambda: self.engine.logout()),
+        ):
+            b = Button(text=text, size_hint_y=None, height=dp(48))
+            b.bind(on_release=lambda _b, f=fn: f())
+            box.add_widget(b)
+
+    def save_settings(self):
+        try:
+            for key, (w, cast) in self.fields.items():
+                if cast is bool:
+                    core.CFG[key] = bool(w.active)
+                elif cast is int:
+                    core.CFG[key] = int(w.text.strip() or 0)
+                else:
+                    core.CFG[key] = w.text.strip()
+            core.CFG["destination"] = core.clean_username(core.CFG["destination"]) or "me"
+        except ValueError:
+            self.info("Помилка", "Числові поля містять некоректне значення.")
+            return
+        core.save_config()
+        self.ids_.json_edit.text = json.dumps(core.CFG, ensure_ascii=False, indent=2)
+        self.info("Збережено", "Натисніть «Перезапуск», щоб застосувати.")
+
+    def save_json(self):
+        try:
+            data = json.loads(self.ids_.json_edit.text)
+            if not isinstance(data, dict):
+                raise ValueError("корінь має бути обʼєктом")
+        except Exception as exc:
+            self.info("Помилка JSON", str(exc))
+            return
+        for k, v in data.items():
+            if k in core.DEFAULT_CONFIG:
+                core.CFG[k] = v
+        core.CFG["sources"] = core.normalize_sources(core.CFG["sources"])
+        core.save_config()
+        self.refresh_channels()
+        self.info("Збережено", "Конфіг застосовано. Натисніть «Перезапуск».")
+
+
+if __name__ == "__main__":
+    AlertApp().run()
