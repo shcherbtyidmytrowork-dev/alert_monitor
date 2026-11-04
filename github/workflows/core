@@ -1,0 +1,1240 @@
+# -*- coding: utf-8 -*-
+"""Ядро моніторингу тривог (Telegram) - без Tkinter, для Android/Kivy.
+Логіка двигуна взята з alert_monitor_app.py без змін. Папка даних: змінна ALERT_DATA_DIR."""
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import copy
+import difflib
+import json
+import logging
+import os
+import queue
+import re
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+APP_TITLE = "Моніторинг тривог — Дністровський район"
+APP_NAME = "DnistrovskyiAlertMonitor"
+
+BASE_DIR = Path(os.environ.get("ALERT_DATA_DIR") or Path(__file__).resolve().parent)
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Сесія з попередніх версій - якщо ви вже входили, повторний вхід не потрібен.
+SESSION_PATH = str(BASE_DIR / "alert_session_v3")
+STATE_PATH = BASE_DIR / "alert_dnistrovskyi_state.json"
+CONFIG_PATH = BASE_DIR / "alert_config.json"
+LOG_PATH = BASE_DIR / "alert_dnistrovskyi.log"
+
+MODE_LABELS = {
+    "alerts": "Тривоги (розпізнавати)",
+    "forward": "Дублювати як є",
+    "keywords": "Фільтр за ключовими словами",
+    "outages": "Графік відключень світла",
+}
+
+MATCH_LABELS = {"any": "будь-яке зі слів", "all": "усі слова разом"}
+SEND_LABELS = {
+    "copy": "Від себе, без авторства (текст + медіа заново)",
+    "forward": "Повністю, з авторством (справжнє пересилання)",
+}
+MODE_HINTS = {
+    "alerts": "Режим «Тривоги»: ключові слова НЕ потрібні - використовуються тригери з вкладки «Тригери і дублі».",
+    "keywords": "Режим «Фільтр»: надсилається лише повідомлення, де є слова з поля «Ключові слова» ЦЬОГО каналу.",
+    "outages": "Режим «Графік»: слова цього каналу; якщо порожньо - стандартний набір про відключення світла.",
+    "forward": "Режим «Дублювати»: пересилається все; ключові слова не потрібні, стоп-слова - за бажанням.",
+}
+# Стандартний набір ЛИШЕ для режиму «Графік», коли в каналу не задано власних слів.
+DEFAULT_OUTAGE_WORDS = [
+    "графік відключень", "графіки відключень", "відключення світла", "відключення електро",
+    "погодинн", "черги відключень", "обленерго", "електропостачання", "не буде світла",
+    "обмеження споживання",
+]
+
+
+# ============================ УТИЛІТИ ============================
+def clean_username(value: str) -> str:
+    value = str(value).strip()
+    value = re.sub(r"^(https?://)?(t\.me/|telegram\.me/)", "", value)
+    return value.lstrip("@").strip("/ ")
+
+
+def entity_ref(name: str) -> Any:
+    return int(name) if re.fullmatch(r"-?\d+", name) else name
+
+
+def normalize_sources(raw: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, str):
+            item = {"name": item}
+        if not isinstance(item, dict):
+            continue
+        name = clean_username(item.get("name", ""))
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        mode = item.get("mode", "alerts")
+        if mode not in MODE_LABELS:
+            mode = "alerts"
+        out.append({
+            "name": name,
+            "mode": mode,
+            "enabled": bool(item.get("enabled", True)),
+            "include": [str(x).strip() for x in item.get("include", []) if str(x).strip()],
+            "exclude": [str(x).strip() for x in item.get("exclude", []) if str(x).strip()],
+            "match": "all" if item.get("match") == "all" else "any",
+            "send_mode": "forward" if item.get("send_mode") == "forward" else "copy",
+            "send_media": bool(item.get("send_media", True)),
+            "template": str(item.get("template", "{text}")) or "{text}",
+            "dedup": bool(item.get("dedup", True)),
+        })
+    return out
+
+
+# ============================ КОНФІГ ============================
+DEFAULT_CONFIG: dict[str, Any] = {
+    # Краще задати змінними середовища TG_API_ID / TG_API_HASH.
+    "api_id": int(os.getenv("TG_API_ID", "0")),
+    "api_hash": os.getenv("TG_API_HASH", ""),
+    "sources": [
+        # ОДА: при ключових словах тривоги/відбою — точний дубль тексту в призначення
+        {"name": "chernivetskaODA", "mode": "alerts", "enabled": True},
+        {"name": "pereval_media", "mode": "alerts", "enabled": False},
+        {"name": "dima_bombastic", "mode": "forward", "enabled": True},
+        # Суспільне: графік відключень + картинка (медіа)
+        {
+            "name": "suspilne_chernivtsi",
+            "mode": "outages",
+            "enabled": True,
+            "include": DEFAULT_OUTAGE_WORDS + ["аварійн"],
+            "exclude": ["реклама", "підписуйтесь", "розіграш"],
+            "template": "{text}",
+            "dedup": True,
+        },
+    ],
+    "destination": "nedoboivskaotg_official",
+    "district_name": "Дністровський район",
+    "include_oblast_alerts": True,
+    "auto_join_sources": False,
+    "close_to_tray": True,
+    "check_interval_seconds": 20,   # 0 = лише миттєві події, без опитування
+    "send_delay_seconds": 0,        # затримка перед відправкою кожного повідомлення
+    "send_gap_seconds": 0,          # мінімальна пауза між двома відправками
+    # --- ключові слова тривог ---
+    "alert_words": ["повітряна тривога", "повітряну тривогу"],
+    "clear_words": ["відбій"],
+    "threat_types": [
+        {"label": "ракетна загроза", "words": ["ракет"]},
+        {"label": "дронова загроза", "words": ["бпла", "дрон", "шахед", "безпілот"]},
+    ],
+    # Небезпечні тригери: match = any (будь-яке слово) / all (усі слова разом)
+    "danger_triggers": [
+        {"name": "Зліт МіГ", "words": ["зліт", "word:міг"], "match": "all", "cooldown": 600,
+         "message": "⚠️ Зафіксовано зліт МіГ!", "enabled": True},
+    ],
+    "first_run_done": False,        # службове: автозапуск з Windows вмикається один раз при першому старті
+    # --- дублікати ---
+    "dedup_enabled": True,
+    "dedup_scope": "global",        # global - серед усіх каналів; channel - в межах одного каналу
+    "dedup_window_seconds": 300,
+    "dedup_similarity": 0.92,       # 1.0 = лише ідентичний текст
+    "alert_state_dedup": True,      # не повторювати ту саму активну тривогу
+    # --- інше ---
+    "dry_run": False,               # тестовий режим: нічого не надсилає, лише пише в лог
+    "sound": False,                 # звук при відправці (Windows)
+    "max_message_age_seconds": 900,
+}
+CFG: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+
+
+def load_config() -> None:
+    try:
+        saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(saved, dict):
+        return
+    # міграція зі старого формату (source_channels + monitor_user)
+    if "sources" not in saved and ("source_channels" in saved or "monitor_user" in saved):
+        srcs = [{"name": s, "mode": "alerts", "enabled": True} for s in saved.get("source_channels", [])]
+        mu = clean_username(saved.get("monitor_user", "") or "")
+        if mu:
+            srcs.append({"name": mu, "mode": "forward", "enabled": bool(saved.get("forward_monitor_user", True))})
+        saved["sources"] = srcs
+    for k, v in saved.items():
+        if k in DEFAULT_CONFIG:
+            CFG[k] = v
+    if "danger_triggers" not in saved:  # міграція налаштувань МіГ зі старої версії
+        for t in CFG["danger_triggers"]:
+            if t["name"] == "Зліт МіГ":
+                t["enabled"] = bool(saved.get("send_mig_takeoff", True))
+                t["cooldown"] = int(saved.get("mig_cooldown_seconds", 600))
+    CFG["sources"] = normalize_sources(CFG["sources"])
+
+
+def save_config() -> None:
+    CONFIG_PATH.write_text(json.dumps(CFG, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def enabled_sources() -> list[dict[str, Any]]:
+    return [s for s in CFG["sources"] if s.get("enabled", True)]
+
+
+DISTRICT_WORDS = ("дністров", "дністровськ")
+OBLAST_WORDS = ("чернівецьк", "черновицк")
+OTHER_DISTRICT_WORDS = ("вижницьк", "чернівецький район", "чернівецького району")
+LEVELS = (
+    ("помаранч", "🟠", "помаранчевий рівень"),
+    ("оранж", "🟠", "помаранчевий рівень"),
+    ("жовт", "🟡", "жовтий рівень"),
+    ("червон", "🔴", "червоний рівень"),
+)
+SCOPE_LABEL = {"district": "район", "oblast": "область", "general": "загальна"}
+
+
+class QueueLogHandler(logging.Handler):
+    def __init__(self, q: "queue.Queue") -> None:
+        super().__init__()
+        self.q = q
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.q.put(("log", record.levelname, self.format(record)))
+        except Exception:
+            pass
+
+
+def setup_logging(q: "queue.Queue") -> None:
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%d.%m.%Y %H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    handlers: list[logging.Handler] = [logging.FileHandler(LOG_PATH, encoding="utf-8"), QueueLogHandler(q)]
+    if sys.stdout is not None:  # під pythonw / --noconsole консолі немає
+        handlers.append(logging.StreamHandler(sys.stdout))
+    for h in handlers:
+        h.setFormatter(fmt)
+        root.addHandler(h)
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+
+
+def fmt_ts(ts: float | None) -> str:
+    return time.strftime("%d.%m %H:%M:%S", time.localtime(ts)) if ts else ""
+
+
+def fmt_duration(sec: float) -> str:
+    sec = int(sec)
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    return (f"{d} д " if d else "") + f"{h:02d}:{m:02d}:{s:02d}"
+
+
+
+ENGINE_COLORS = {"працює": "#1e8e3e", "зупинено": "#777777", "помилка": "#c62828"}
+LEVEL_COLORS = {"ok": "#1e8e3e", "warn": "#d98200", "err": "#c62828", "idle": "#777777"}
+
+
+# ============================ ПАРСИНГ ПОВІДОМЛЕНЬ ============================
+def normalize(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", text.casefold().replace("_", " ")).strip()
+
+
+def contains_any(text: str, words: tuple[str, ...]) -> bool:
+    return any(word in text for word in words)
+
+
+def match_word(text: str, pattern: str) -> bool:
+    """Формати: "ракет" - підрядок; "word:каб" - ціле слово; "re:ту-?\\d+" - регулярний вираз."""
+    pattern = pattern.strip()
+    if not pattern:
+        return False
+    low = pattern.casefold()
+    if low.startswith("re:"):
+        try:
+            return re.search(pattern[3:], text, flags=re.IGNORECASE) is not None
+        except re.error:
+            return False
+    if low.startswith("word:"):
+        return re.search(r"(?<!\w)" + re.escape(low[5:]) + r"(?!\w)", text) is not None
+    return low in text
+
+
+def any_match(text: str, patterns: Any) -> bool:
+    return any(match_word(text, w) for w in patterns or [])
+
+
+def keyword_hits(text: str, words: Any, match: str = "any") -> list[str]:
+    """Повертає знайдені слова. match="all": результат непорожній, лише якщо знайдено УСІ слова."""
+    words = [w for w in (words or []) if str(w).strip()]
+    hits = [w for w in words if match_word(text, w)]
+    if match == "all" and len(hits) != len(words):
+        return []
+    return hits
+
+
+def kw_summary(src: dict[str, Any]) -> str:
+    mode = src.get("mode")
+    inc = src.get("include") or []
+    if mode == "alerts":
+        return "глобальні тригери"
+    if mode == "forward":
+        return "усе"
+    if not inc:
+        return "стандартні" if mode == "outages" else "⚠ не задано"
+    txt = ", ".join(inc[:4]) + (f" … (+{len(inc) - 4})" if len(inc) > 4 else "")
+    return ("УСІ: " if src.get("match") == "all" and len(inc) > 1 else "") + txt
+
+
+def detect_scope(text: str) -> str:
+    text = normalize(text)
+    if contains_any(text, DISTRICT_WORDS):
+        return "district"
+    if contains_any(text, OTHER_DISTRICT_WORDS):
+        return "other"
+    if contains_any(text, OBLAST_WORDS):
+        return "oblast"
+    return "general"
+
+
+def detect_level(text: str) -> tuple[str, str] | None:
+    text = normalize(text)
+    for stem, emoji, label in LEVELS:
+        if stem in text:
+            return emoji, label
+    return None
+
+
+def detect_threat(text: str) -> str | None:
+    text = normalize(text)
+    for t in CFG["threat_types"]:
+        if any_match(text, t.get("words", [])):
+            return str(t.get("label", "")) or None
+    return None
+
+
+def trigger_matches(text: str, trig: dict[str, Any]) -> bool:
+    words = trig.get("words", [])
+    if not trig.get("enabled", True) or not words:
+        return False
+    if trig.get("match", "any") == "all":
+        return all(match_word(text, w) for w in words)
+    return any_match(text, words)
+
+
+def parse_source_message(raw: str) -> list[dict[str, Any]]:
+    text = normalize(raw)
+    if not text:
+        return []
+    events: list[dict[str, Any]] = []
+    scope = detect_scope(text)
+
+    if any_match(text, CFG["clear_words"]) and scope != "other":
+        events.append({"type": "clear", "scope": scope})
+
+    if any_match(text, CFG["alert_words"]) and scope != "other":
+        events.append({
+            "type": "alert",
+            "scope": scope,
+            "level": detect_level(text),
+            "threat": detect_threat(text),
+        })
+
+    for trig in CFG["danger_triggers"]:
+        if trigger_matches(text, trig):
+            events.append({"type": "danger", "trigger": trig, "raw": raw})
+    return events
+
+
+def beep() -> None:
+    if sys.platform.startswith("win"):
+        try:
+            import winsound
+            threading.Thread(target=lambda: (winsound.Beep(1000, 250), winsound.Beep(1400, 250)),
+                             daemon=True).start()
+        except Exception:
+            pass
+
+
+# ============================ ДВИГУН (Telegram) ============================
+class LoginCancelled(Exception):
+    pass
+
+
+class LoginFailed(Exception):
+    pass
+
+
+class FatalConfig(Exception):
+    pass
+
+
+class Engine:
+    """Працює у власному потоці з asyncio. Усі публічні методи безпечно викликати з GUI."""
+
+    def __init__(self, ui_q: "queue.Queue") -> None:
+        self.ui = ui_q
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop_thread, daemon=True, name="tg-loop").start()
+
+        self.client: Any = None
+        self.dest_entity: Any = None
+        self.sup_task: asyncio.Task | None = None
+        self.wake: asyncio.Event | None = None
+        self.proc_lock: asyncio.Lock | None = None
+        self.stop_flag = False
+        self.final: tuple[str, str] | None = None
+        self.login_cancel = threading.Event()
+        self.pending: set[concurrent.futures.Future] = set()
+        self.src: dict[int, dict[str, Any]] = {}
+        self.seen: deque = deque(maxlen=2000)
+        self.last_send_ts = 0.0
+        self.recent: deque = deque(maxlen=500)  # (час, джерело, нормалізований текст)
+
+        self.state: dict[str, Any] = {
+            "active_key": None, "active_scope": None,
+            "active_desc": None, "active_since": None, "trigger_last": {},
+        }
+        self._load_state()
+        self.st = self._blank_status()
+        self._refresh_alert_status()
+
+    # ---------- службові ----------
+    def _loop_thread(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def _submit(self, coro: Any) -> concurrent.futures.Future:
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def _load_state(self) -> None:
+        try:
+            saved = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                self.state.update(saved)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _save_state(self) -> None:
+        try:
+            tmp = STATE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(STATE_PATH)
+        except OSError as exc:
+            logging.warning("Не вдалося зберегти стан: %s", exc)
+
+    @staticmethod
+    def _blank_status() -> dict[str, Any]:
+        return {
+            "engine": "зупинено", "detail": "", "account": "", "started_at": None,
+            "alert": "", "alert_since": None, "alert_active": False,
+            "components": {}, "pending": 0,
+            "counters": {"received": 0, "sent": 0, "skipped": 0, "errors": 0},
+            "last_sent": {"time": None, "text": ""},
+        }
+
+    def push(self) -> None:
+        self.ui.put(("status", copy.deepcopy(self.st)))
+
+    def _set_engine(self, state: str, detail: str = "") -> None:
+        self.st["engine"] = state
+        self.st["detail"] = detail
+        self.push()
+
+    def _comp(self, cid: str, **kw: Any) -> None:
+        if cid in self.st["components"]:
+            self.st["components"][cid].update(kw)
+
+    def _init_components(self) -> None:
+        def mk(label: str, where: str) -> dict[str, Any]:
+            return {"label": label, "where": where, "state": "очікування", "level": "idle",
+                    "last": "", "checked": "", "count": 0}
+
+        comps = {"tg": mk("Telegram", "акаунт")}
+        for s in enabled_sources():
+            label = MODE_LABELS.get(s["mode"], s["mode"])
+            comps["src:" + s["name"]] = mk(label, "@" + s["name"])
+        comps["dst"] = mk("Канал-приймач", "@" + CFG["destination"])
+        self.st["components"] = comps
+
+    def _refresh_alert_status(self) -> None:
+        if self.state.get("active_key"):
+            self.st["alert"] = self.state.get("active_desc") or "Тривога активна"
+            self.st["alert_since"] = self.state.get("active_since")
+            self.st["alert_active"] = True
+        else:
+            self.st["alert"] = "Тривоги немає"
+            self.st["alert_since"] = None
+            self.st["alert_active"] = False
+
+    def emit(self, source: str, kind: str, outcome: str, detail: str, text: str) -> None:
+        if outcome == "skip":
+            self.st["counters"]["skipped"] += 1
+        elif outcome == "error":
+            self.st["counters"]["errors"] += 1
+        self.ui.put(("event", {
+            "ts": time.time(), "source": source, "kind": kind,
+            "outcome": outcome, "detail": detail, "text": text,
+        }))
+
+    async def _sleep(self, sec: float) -> bool:
+        """True - відпрацювали повністю, False - перервано зупинкою."""
+        if sec <= 0:
+            return not self.stop_flag
+        wake = self.wake
+        if wake is None:
+            await asyncio.sleep(sec)
+            return True
+        try:
+            await asyncio.wait_for(wake.wait(), sec)
+            return False
+        except asyncio.TimeoutError:
+            return True
+
+    # ---------- команди для GUI ----------
+    def start(self) -> None:
+        self._submit(self._start_coro())
+
+    def stop(self) -> None:
+        self._submit(self._stop_coro())
+
+    def restart(self) -> None:
+        self._submit(self._restart_coro())
+
+    def logout(self) -> None:
+        self._submit(self._logout_coro())
+
+    def send_test(self) -> None:
+        self._submit(self._test_coro())
+
+    def reset_alert(self) -> None:
+        self._submit(self._reset_alert_coro())
+
+    def check_channel(self, name: str) -> None:
+        self._submit(self._check_coro(name))
+
+    def cancel_login(self) -> None:
+        self.login_cancel.set()
+        for fut in list(self.pending):
+            fut.cancel()
+
+    def shutdown(self, timeout: float = 12.0) -> None:
+        try:
+            self._submit(self._stop_coro()).result(timeout)
+        except Exception:
+            pass
+
+    # ---------- керування життєвим циклом ----------
+    async def _start_coro(self) -> None:
+        if self.sup_task and not self.sup_task.done():
+            return
+        self.stop_flag = False
+        self.final = None
+        self.login_cancel.clear()
+        self.wake = asyncio.Event()
+        self.proc_lock = asyncio.Lock()
+        self.st["pending"] = 0
+        self.sup_task = asyncio.get_running_loop().create_task(self._supervisor())
+
+    async def _stop_coro(self) -> None:
+        self.stop_flag = True
+        self.login_cancel.set()
+        for fut in list(self.pending):
+            fut.cancel()
+        if self.wake:
+            self.wake.set()
+        client = self.client
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        if self.sup_task and not self.sup_task.done():
+            try:
+                await asyncio.wait_for(self.sup_task, 15)
+            except Exception:
+                self.sup_task.cancel()
+        if self.st["engine"] != "помилка":
+            self._set_engine("зупинено", "Зупинено користувачем")
+
+    async def _restart_coro(self) -> None:
+        logging.info("Перезапуск бота...")
+        await self._stop_coro()
+        await asyncio.sleep(0.5)
+        await self._start_coro()
+
+    async def _reset_alert_coro(self) -> None:
+        self.state.update(active_key=None, active_scope=None, active_desc=None, active_since=None)
+        self._save_state()
+        self._refresh_alert_status()
+        self.push()
+        logging.info("Стан тривоги скинуто вручну")
+        self.emit("Користувач", "Скидання стану", "ok", "", "Стан тривоги скинуто вручну")
+
+    async def _test_coro(self) -> None:
+        if not self.client or self.dest_entity is None or not self.client.is_connected():
+            self.ui.put(("notify", "Тест", "Бот не підключений. Спочатку запустіть його.", "warning"))
+            return
+        ok = await self._send("🔧 Тестове повідомлення: перевірка зв'язку", apply_delay=False)
+        self.emit("Користувач", "Тест", "sent" if ok else "error", "", "Тестове повідомлення")
+
+    async def _check_coro(self, name: str) -> None:
+        if not self.client or not self.client.is_connected():
+            self.ui.put(("notify", "Перевірка каналу", "Бот не підключений. Запустіть його і повторіть.", "warning"))
+            return
+        try:
+            from telethon.tl.types import Channel, User
+
+            ent = await self.client.get_entity(entity_ref(name))
+            if isinstance(ent, Channel):
+                kind = "група" if getattr(ent, "megagroup", False) else "канал"
+                sub = ("ви підписані" if not getattr(ent, "left", False)
+                       else "⚠ ви НЕ підписані - нові пости не надходитимуть (підпишіться або увімкніть автопідписку)")
+                text = f"@{name}: знайдено {kind} «{ent.title}».\n{sub}."
+            elif isinstance(ent, User):
+                text = f"@{name}: знайдено користувача {ent.first_name or ''}.\nПовідомлення з приватного чату читатимуться."
+            else:
+                text = f"@{name}: знайдено ({type(ent).__name__})."
+            self.ui.put(("notify", "Перевірка каналу", text, "info"))
+        except Exception as exc:
+            self.ui.put(("notify", "Перевірка каналу", f"@{name}: не вдалося знайти ({type(exc).__name__}: {exc})", "error"))
+
+    async def _logout_coro(self) -> None:
+        await self._stop_coro()
+        logging.info("Вихід з акаунта Telegram...")
+        try:
+            from telethon import TelegramClient
+
+            if Path(SESSION_PATH + ".session").exists():
+                client = TelegramClient(SESSION_PATH, int(CFG["api_id"]), str(CFG["api_hash"]))
+                await client.connect()
+                try:
+                    if await client.is_user_authorized():
+                        await client.log_out()
+                finally:
+                    await client.disconnect()
+        except Exception as exc:
+            logging.warning("Не вдалося коректно вийти на сервері: %s", exc)
+        for suffix in (".session", ".session-journal"):
+            try:
+                Path(SESSION_PATH + suffix).unlink()
+            except OSError:
+                pass
+        self.st["account"] = ""
+        self._set_engine("зупинено", "Ви вийшли з акаунта. Натисніть «Запустити», щоб увійти знову.")
+        self.ui.put(("notify", "Вихід", "Ви вийшли з акаунта Telegram.", "info"))
+
+    # ---------- supervisor: сам перепідключається ----------
+    async def _supervisor(self) -> None:
+        backoff = 5
+        while not self.stop_flag:
+            try:
+                await self._session()
+                backoff = 5
+            except (LoginCancelled, LoginFailed) as exc:
+                logging.warning("Вхід перервано: %s", exc or "скасовано")
+                self.final = ("зупинено", str(exc) or "Вхід скасовано")
+                if isinstance(exc, LoginFailed):
+                    self.ui.put(("notify", "Вхід не вдався", str(exc), "error"))
+                break
+            except FatalConfig as exc:
+                logging.error("%s", exc)
+                self.final = ("помилка", str(exc))
+                self.ui.put(("notify", "Помилка налаштувань", str(exc), "error"))
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if type(exc).__name__ == "ApiIdInvalidError":
+                    self.final = ("помилка", "Невірні API ID / API Hash")
+                    self.ui.put(("notify", "Помилка", "Telegram відхилив API ID / API Hash. Перевірте налаштування.", "error"))
+                    break
+                msg = f"{type(exc).__name__}: {exc}"
+                logging.error("Збій сесії: %s", msg)
+                self.st["detail"] = msg
+                for c in self.st["components"].values():
+                    if c["level"] == "ok":
+                        c.update(state="немає зв'язку", level="warn")
+            if self.stop_flag:
+                break
+            self._set_engine("перепідключення", f"{self.st['detail']} | повтор через {backoff} с")
+            await self._sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        state, detail = self.final or ("зупинено", "")
+        self.st["started_at"] = None
+        self._set_engine(state, detail)
+
+    # ---------- діалоги входу через GUI ----------
+    async def ask(self, kind: str, title: str, prompt: str, secret: bool = False,
+                  options: list[tuple[str, str]] | None = None) -> str:
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        self.pending.add(fut)
+        self.ui.put(("ask", fut, kind, title, prompt, secret, options))
+        try:
+            result = await asyncio.wrap_future(fut)
+        except (asyncio.CancelledError, concurrent.futures.CancelledError):
+            raise LoginCancelled("Вхід скасовано")
+        finally:
+            self.pending.discard(fut)
+        if result is None or self.login_cancel.is_set():
+            raise LoginCancelled("Вхід скасовано")
+        return result
+
+    async def _login(self, client: Any) -> None:
+        self._set_engine("потрібен вхід", "Увійдіть у Telegram у вікні, що з'явилося")
+        self._comp("tg", state="потрібен вхід", level="warn")
+        self.push()
+        choice = await self.ask(
+            "choice", "Вхід у Telegram", "Оберіть спосіб входу:",
+            options=[("qr", "📱 QR-код (рекомендовано)"), ("code", "🔢 Код підтвердження")],
+        )
+        ok = await (self._login_qr(client) if choice == "qr" else self._login_code(client))
+        if not ok or not await client.is_user_authorized():
+            raise LoginFailed("Вхід не вдався. Спробуйте ще раз (краще через QR-код).")
+
+    async def _login_2fa(self, client: Any) -> bool:
+        from telethon.errors import PasswordHashInvalidError
+
+        for _ in range(3):
+            pwd = await self.ask("text", "Двоетапна перевірка", "Введіть пароль 2FA:", secret=True)
+            try:
+                await client.sign_in(password=pwd)
+                return True
+            except PasswordHashInvalidError:
+                self.ui.put(("notify", "Вхід", "Невірний пароль 2FA.", "warning"))
+        return False
+
+    async def _login_qr(self, client: Any) -> bool:
+        from telethon.errors import SessionPasswordNeededError
+
+        qr = await client.qr_login()
+        created = time.monotonic()
+        deadline = time.monotonic() + 600
+        try:
+            self.ui.put(("qr", qr.url))
+            while time.monotonic() < deadline:
+                if self.login_cancel.is_set():
+                    raise LoginCancelled("Вхід скасовано")
+                try:
+                    await qr.wait(2)
+                    return True
+                except asyncio.TimeoutError:
+                    if time.monotonic() - created > 25:  # токен живе ~30 с
+                        await qr.recreate()
+                        created = time.monotonic()
+                        self.ui.put(("qr", qr.url))
+                except SessionPasswordNeededError:
+                    return await self._login_2fa(client)
+            return False
+        finally:
+            self.ui.put(("qr", None))
+
+    async def _login_code(self, client: Any) -> bool:
+        from telethon.errors import (FloodWaitError, PhoneCodeExpiredError, PhoneCodeInvalidError,
+                                     PhoneNumberInvalidError, SessionPasswordNeededError)
+        from telethon.tl.functions.auth import ResendCodeRequest
+
+        phone = (await self.ask("text", "Вхід за кодом", "Номер телефону (+380XXXXXXXXX):")).strip()
+        try:
+            sent = await client.send_code_request(phone)
+        except PhoneNumberInvalidError:
+            raise LoginFailed("Невірний номер телефону.")
+        except FloodWaitError as exc:
+            raise LoginFailed(f"Забагато спроб. Зачекайте {exc.seconds} с або увійдіть через QR.")
+
+        hints = {"SentCodeTypeApp": "у додаток Telegram (чат «Telegram» на іншому вашому пристрої)",
+                 "SentCodeTypeSms": "в SMS", "SentCodeTypeCall": "дзвінком"}
+        for _ in range(6):
+            where = type(sent.type).__name__
+            code = await self.ask(
+                "text", "Код підтвердження",
+                f"Код надіслано: {hints.get(where, where)}.\n\nВведіть код без пробілів.\n"
+                "Літера «r» - надіслати код повторно.\n"
+                "НЕ пересилайте код нікому в Telegram - він стане недійсним.",
+            )
+            if code.strip().lower() == "r":
+                try:
+                    sent = await client(ResendCodeRequest(phone, sent.phone_code_hash))
+                except Exception as exc:
+                    self.ui.put(("notify", "Код", f"Не вдалося надіслати повторно: {exc}", "warning"))
+                continue
+            digits = re.sub(r"\D", "", code)
+            try:
+                await client.sign_in(phone, digits, phone_code_hash=sent.phone_code_hash)
+                return True
+            except SessionPasswordNeededError:
+                return await self._login_2fa(client)
+            except PhoneCodeInvalidError:
+                self.ui.put(("notify", "Код", "Невірний код. Спробуйте ще раз.", "warning"))
+            except PhoneCodeExpiredError:
+                self.ui.put(("notify", "Код", "Код прострочений - надсилаю новий.", "warning"))
+                sent = await client.send_code_request(phone)
+        return False
+
+    # ---------- основна сесія ----------
+    async def _session(self) -> None:
+        from telethon import TelegramClient, events, utils
+        from telethon.tl.types import Channel, User
+
+        api_id, api_hash = CFG["api_id"], str(CFG["api_hash"]).strip()
+        if not isinstance(api_id, int) or api_id <= 0 or not api_hash:
+            raise FatalConfig("Заповніть API ID та API Hash у вкладці «Налаштування».")
+        if not enabled_sources():
+            raise FatalConfig("Немає жодного увімкненого каналу. Додайте канал у вкладці «Канали».")
+
+        self._init_components()
+        self.st["detail"] = ""
+        self._set_engine("підключення", "Підключення до Telegram...")
+        client = TelegramClient(
+            SESSION_PATH, api_id, api_hash, auto_reconnect=True,
+            request_retries=5, connection_retries=10, retry_delay=3,
+            device_model="Alert Monitor Android", app_version="3.0", system_version="Android",
+        )
+        self.client = client
+        handlers: list[Any] = []
+        interval = max(0, int(CFG["check_interval_seconds"]))
+        try:
+            await client.connect()
+            self._comp("tg", state="підключено", level="ok")
+
+            if not await client.is_user_authorized():
+                await self._login(client)  # лише якщо ще не залогінені
+            else:
+                logging.info("Сесія вже авторизована - вхід не потрібен")
+
+            me = await client.get_me()
+            account = " ".join(filter(None, [me.first_name, me.last_name])) or str(me.id)
+            if me.username:
+                account += f" (@{me.username})"
+            self.st["account"] = account
+            self._comp("tg", where=account, state="авторизовано", level="ok", last=fmt_ts(time.time()))
+            logging.info("Акаунт: %s", account)
+            self.push()
+
+            # --- канали / джерела ---
+            self.src = {}
+            entities = []
+            listen = "слухаю (миттєво" + (f" + перевірка кожні {interval} с)" if interval else ")")
+            for s in enabled_sources():
+                name, cid = s["name"], "src:" + s["name"]
+                try:
+                    ent = await client.get_entity(entity_ref(name))
+                    if CFG["auto_join_sources"] and isinstance(ent, Channel) and getattr(ent, "left", False):
+                        from telethon.tl.functions.channels import JoinChannelRequest
+                        await client(JoinChannelRequest(ent))
+                        logging.info("Підписано на @%s", name)
+                        ent = await client.get_entity(entity_ref(name))
+                    left = isinstance(ent, Channel) and getattr(ent, "left", False)
+                    ok_state = "⚠ ви не підписані - оновлень не буде" if left else listen
+                    ok_level = "warn" if left else "ok"
+                    if left:
+                        logging.warning("@%s: акаунт не підписаний, нові пости не надходитимуть", name)
+                    self.src[utils.get_peer_id(ent)] = {
+                        "name": name, "mode": s["mode"], "cfg": s, "entity": ent, "last_id": 0,
+                        "is_user": isinstance(ent, User), "ok_state": ok_state, "ok_level": ok_level,
+                    }
+                    entities.append(ent)
+                    self._comp(cid, state=ok_state, level=ok_level)
+                except Exception as exc:
+                    self._comp(cid, state=f"недоступне ({type(exc).__name__})", level="err")
+                    logging.error("Канал %s недоступний: %s", name, exc)
+
+            # --- приймач ---
+            try:
+                dest = CFG["destination"]
+                self.dest_entity = "me" if dest == "me" else await client.get_entity(entity_ref(dest))
+                self._comp("dst", state="готовий", level="ok")
+            except Exception as exc:
+                self._comp("dst", state=f"недоступний ({type(exc).__name__})", level="err")
+                raise RuntimeError(f"Не знайдено канал-приймач {CFG['destination']}: {exc}")
+
+            if not self.src:
+                raise RuntimeError("Жоден канал-джерело недоступний")
+
+            client.add_event_handler(self._on_new, events.NewMessage(chats=entities))
+            handlers.append(self._on_new)
+
+            # базова точка для опитування: не переобробляємо старі пости
+            if interval:
+                for info in self.src.values():
+                    try:
+                        last = await client.get_messages(info["entity"], limit=1)
+                        info["last_id"] = last[0].id if last else 0
+                    except Exception as exc:
+                        logging.warning("@%s: не вдалося визначити останнє повідомлення: %s", info["name"], exc)
+                    self._comp("src:" + info["name"], checked=fmt_ts(time.time()))
+
+            self.st["started_at"] = time.time()
+            self._set_engine("працює", "")
+            logging.info("Запущено: каналів %s, інтервал перевірки %s с, затримка відправки %s с",
+                         len(self.src), interval, CFG["send_delay_seconds"])
+
+            down_since: float | None = None
+            next_poll = time.time() + interval if interval else None
+            while not self.stop_flag:
+                if not await self._sleep(2):
+                    break
+                if client.is_connected():
+                    if down_since is not None:
+                        logging.info("Зв'язок відновлено")
+                        self._set_engine("працює", "")
+                        self._comp("tg", state="авторизовано", level="ok")
+                    down_since = None
+                    if next_poll is not None and time.time() >= next_poll:
+                        await self._poll_all()
+                        next_poll = time.time() + interval
+                else:
+                    if down_since is None:
+                        down_since = time.time()
+                        logging.warning("Зв'язок з Telegram втрачено, чекаю відновлення...")
+                        self._comp("tg", state="немає зв'язку", level="warn")
+                        self._set_engine("перепідключення", "Немає зв'язку з Telegram")
+                    elif time.time() - down_since > 90:
+                        raise ConnectionError("Немає зв'язку понад 90 с")
+                self.push()
+        finally:
+            for h in handlers:
+                try:
+                    client.remove_event_handler(h)
+                except Exception:
+                    pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+            self.dest_entity = None
+            self.st["started_at"] = None
+
+    # ---------- періодична перевірка каналів ----------
+    async def _poll_all(self) -> None:
+        from telethon.errors import FloodWaitError
+
+        for pid, info in list(self.src.items()):
+            if self.stop_flag or self.client is None:
+                return
+            cid = "src:" + info["name"]
+            try:
+                msgs = await self.client.get_messages(info["entity"], min_id=info["last_id"], limit=20)
+                self._comp(cid, checked=fmt_ts(time.time()), state=info["ok_state"], level=info["ok_level"])
+                for m in sorted(msgs, key=lambda x: x.id):
+                    await self._process(pid, m, "перевірка")
+            except FloodWaitError as exc:
+                logging.warning("FloodWait під час перевірки: %s с", exc.seconds)
+                await self._sleep(min(int(exc.seconds) + 1, 60))
+            except Exception as exc:
+                logging.warning("Перевірка @%s не вдалась: %s: %s", info["name"], type(exc).__name__, exc)
+                self._comp(cid, state=f"помилка перевірки ({type(exc).__name__})", level="warn")
+        self.push()
+
+    # ---------- відправка (затримка + пауза між повідомленнями) ----------
+    async def _send(
+        self,
+        text: str,
+        arrived: float | None = None,
+        apply_delay: bool = True,
+        media: Any = None,
+        forward_from: Any = None,
+    ) -> bool:
+        """Надсилає текст; якщо media (фото/документ з оригіналу) — пересилає разом із підписом."""
+        from telethon.errors import FloodWaitError
+
+        if apply_delay:
+            delay = float(CFG["send_delay_seconds"])
+            if arrived is not None:
+                delay -= time.time() - arrived  # затримку рахуємо від моменту надходження
+            if delay > 0:
+                logging.info("Затримка відправки: %.0f с", delay)
+                if not await self._sleep(delay):
+                    logging.info("Відправку скасовано (зупинка бота)")
+                    return False
+            gap = self.last_send_ts + float(CFG["send_gap_seconds"]) - time.time()
+            if gap > 0 and not await self._sleep(gap):
+                return False
+        if CFG["dry_run"]:
+            logging.info("[ТЕСТОВИЙ РЕЖИМ] не надіслано%s%s: %s", " (+медіа)" if media else "",
+                         " (пересилання)" if forward_from is not None else "", text.replace("\n", " | "))
+            self.last_send_ts = time.time()
+            return True
+        if self.client is None or self.dest_entity is None or self.stop_flag:
+            return False
+
+        logging.info("Надсилання%s: %s", " (+медіа)" if media else "", text.replace("\n", " | "))
+        for attempt in range(3):
+            try:
+                if forward_from is not None:
+                    await self.client.forward_messages(self.dest_entity, forward_from)
+                elif media is not None:
+                    # фото йде як зображення (не файл); підпис Telegram обмежує 1024 символами
+                    if len(text) > 1024:
+                        await self.client.send_file(self.dest_entity, media)
+                        await self.client.send_message(self.dest_entity, text)
+                    else:
+                        await self.client.send_file(self.dest_entity, media, caption=text or None)
+                else:
+                    await self.client.send_message(self.dest_entity, text)
+                now = time.time()
+                self.last_send_ts = now
+                if CFG["sound"]:
+                    beep()
+                self.st["counters"]["sent"] += 1
+                self.st["last_sent"] = {"time": now, "text": text}
+                self._comp("dst", state="готовий", level="ok", last=fmt_ts(now),
+                           count=self.st["components"].get("dst", {}).get("count", 0) + 1)
+                self.push()
+                return True
+            except FloodWaitError as exc:
+                delay2 = int(getattr(exc, "seconds", 5)) + 1
+                logging.warning("FloodWait: чекаю %s с (спроба %s/3)", delay2, attempt + 1)
+                if not await self._sleep(delay2):
+                    return False
+            except Exception as exc:
+                logging.exception("Не вдалося надіслати")
+                self._comp("dst", state=f"помилка: {type(exc).__name__}", level="err")
+                self.push()
+                return False
+        return False
+
+    # ---------- дублікати ----------
+    def _is_dup(self, text: str, source: str, per_channel_on: bool = True) -> bool:
+        if not CFG["dedup_enabled"] or not per_channel_on:
+            return False
+        norm = normalize(text)
+        now = time.time()
+        window = float(CFG["dedup_window_seconds"])
+        thr = float(CFG["dedup_similarity"])
+        for ts, src, old in self.recent:
+            if now - ts > window:
+                continue
+            if CFG["dedup_scope"] == "channel" and src != source:
+                continue
+            if old == norm or (thr < 1.0 and difflib.SequenceMatcher(None, old, norm).ratio() >= thr):
+                return True
+        return False
+
+    def _remember(self, text: str, source: str) -> None:
+        self.recent.append((time.time(), source, normalize(text)))
+
+    @staticmethod
+    def _render(template: str, text: str, channel: str) -> str:
+        try:
+            return template.format(text=text, channel=channel)
+        except (KeyError, IndexError, ValueError):
+            return text
+
+    def _res(self, ok: bool) -> tuple[str, str]:
+        if ok:
+            return "sent", ""
+        if self.stop_flag:
+            return "skip", "скасовано: бот зупинено"
+        return "error", ""
+
+    # ---------- логіка тривог ----------
+    async def _handle_item(
+        self,
+        item: dict[str, Any],
+        arrived: float,
+        original_text: str = "",
+    ) -> tuple[str, str, str]:
+        """Повертає (подія, результат sent|skip|error, пояснення).
+
+        Для alert/clear: у канал-призначення надсилається ТОЧНИЙ оригінальний текст
+        з джерела (chernivetskaODA тощо), без перефразування.
+        """
+        t = item["type"]
+        scope = item.get("scope", "general")
+        district = CFG["district_name"]
+        # Текст, який реально піде в призначення — повний оригінал повідомлення
+        payload = (original_text or item.get("raw") or "").strip()
+
+        if t == "danger":
+            trig = item["trigger"]
+            name = str(trig.get("name", "Тригер"))
+            kind = "Тригер: " + name
+            last = float(self.state.setdefault("trigger_last", {}).get(name, 0.0))
+            if time.time() - last < float(trig.get("cooldown", 0)):
+                return kind, "skip", "діє cooldown"
+            # Тригери (МіГ тощо) — можна коротке повідомлення або оригінал
+            message = payload or self._render(str(trig.get("message") or "⚠️ {text}"), "", name)
+            ok = await self._send(message, arrived)
+            if ok:
+                self.state["trigger_last"][name] = time.time()
+                self._save_state()
+            return (kind, *self._res(ok))
+
+        kind = ("Тривога" if t == "alert" else "Відбій") + f" ({SCOPE_LABEL.get(scope, scope)})"
+        if scope == "other":
+            return kind, "skip", "інший район"
+
+        if t == "alert":
+            if scope == "oblast" and not CFG["include_oblast_alerts"]:
+                return kind, "skip", "обласні тривоги вимкнено"
+            level = item.get("level")
+            key = f"alert:{scope}:{level[0] if level else 'unknown'}"
+            if CFG["alert_state_dedup"] and self.state.get("active_key") == key:
+                return kind, "skip", "дубль"
+            # Опис для статусу в GUI (не для відправки)
+            if level:
+                emoji, level_name = level
+                desc = f"{emoji} {district} — повітряна тривога, {level_name}"
+            else:
+                desc = f"❗️ {district} — повітряна тривога"
+            if item.get("threat"):
+                desc += f": {item['threat']}"
+            if not payload:
+                return kind, "skip", "порожній текст"
+            ok = await self._send(payload, arrived)  # точний дубль тексту з ОДА
+            if ok:
+                self.state.update(active_key=key, active_scope=scope, active_desc=desc, active_since=time.time())
+                self._save_state()
+                self._refresh_alert_status()
+                self.push()
+            return (kind, *self._res(ok))
+
+        # відбій — теж точний текст з джерела
+        if not self.state.get("active_key"):
+            return kind, "skip", "активної тривоги не було"
+        if scope == "oblast" and self.state.get("active_scope") == "district":
+            return kind, "skip", "обласний відбій не скасовує районну тривогу"
+        if not payload:
+            return kind, "skip", "порожній текст"
+        ok = await self._send(payload, arrived)
+        if ok:
+            self.state.update(active_key=None, active_scope=None, active_desc=None, active_since=None)
+            self._save_state()
+            self._refresh_alert_status()
+            self.push()
+        return (kind, *self._res(ok))
+
+    # ---------- обробка повідомлень (події + опитування) ----------
+    async def _on_new(self, event: Any) -> None:
+        try:
+            await self._process(event.chat_id, event.message, "подія")
+        except Exception:
+            logging.exception("Помилка обробки повідомлення")
+            self.st["counters"]["errors"] += 1
+
+    async def _process(self, pid: int, msg: Any, via: str) -> None:
+        info = self.src.get(pid)
+        if not info:
+            return
+        key = (pid, msg.id)
+        if key in self.seen:  # те саме повідомлення могло прийти і подією, і опитуванням
+            return
+        self.seen.append(key)
+        info["last_id"] = max(info["last_id"], msg.id)
+        raw = msg.raw_text or ""
+        if not raw.strip():
+            return
+        if info["is_user"] and getattr(msg, "out", False):
+            return  # власні повідомлення в приватному чаті не пересилаємо
+
+        arrived = time.time()
+        name = info["name"]
+        src_label = "@" + name
+        first = raw.strip().splitlines()[0][:200]
+        comp = self.st["components"].get("src:" + name)
+        if comp:
+            comp["last"] = fmt_ts(arrived)
+            comp["count"] += 1
+        self.st["counters"]["received"] += 1
+        logging.info("[%s] @%s: %s", via, name, first)
+
+        if msg.date and arrived - msg.date.timestamp() > CFG["max_message_age_seconds"]:
+            self.emit(src_label, "Повідомлення", "skip", "застаріле", first)
+            self.push()
+            return
+
+        if info["mode"] in ("forward", "keywords", "outages"):
+            scfg = info.get("cfg", {})
+            norm = normalize(raw)
+            if info["mode"] == "forward":
+                kind = "Дублювання"
+            elif info["mode"] == "outages":
+                kind = "Графік відключень"
+            else:
+                kind = "Фільтр"
+            # стоп-слова - ЛИШЕ цього каналу (спільних між каналами немає)
+            if any_match(norm, scfg.get("exclude")):
+                self.emit(src_label, kind, "skip", "стоп-слово каналу", first)
+                self.push()
+                return
+            # ключові слова - ЛИШЕ цього каналу
+            if info["mode"] == "keywords":
+                words = scfg.get("include") or []
+                if not words:
+                    self.emit(src_label, kind, "ignore", "для каналу не задано ключових слів", first)
+                    self.push()
+                    return
+                hits = keyword_hits(norm, words, scfg.get("match", "any"))
+                if not hits:
+                    self.emit(src_label, kind, "ignore", "немає ключових слів каналу", first)
+                    self.push()
+                    return
+                kind += ": " + ", ".join(hits[:3])
+            elif info["mode"] == "outages":
+                words = scfg.get("include") or DEFAULT_OUTAGE_WORDS
+                if not keyword_hits(norm, words, scfg.get("match", "any")):
+                    self.emit(src_label, kind, "ignore", "не графік/відключення", first)
+                    self.push()
+                    return
+            if self._is_dup(raw, name, bool(scfg.get("dedup", True))):
+                self.emit(src_label, kind, "skip", "дубль", first)
+                self.push()
+                return
+            self.st["pending"] += 1
+            self.push()
+            try:
+                async with self.proc_lock:  # type: ignore[union-attr]
+                    send_mode = scfg.get("send_mode", "copy")
+                    media = None
+                    if scfg.get("send_media", True):
+                        media = (getattr(msg, "photo", None) or getattr(msg, "document", None)
+                                 or getattr(msg, "media", None))
+                    if send_mode == "forward":
+                        # справжнє пересилання: повне повідомлення з авторством (текст і медіа - як в оригіналі)
+                        ok = await self._send(raw, arrived, forward_from=msg)
+                        if ok:
+                            self._remember(raw, name)
+                        outcome, detail = self._res(ok)
+                        self.emit(src_label, kind, outcome, detail or "з авторством", first)
+                        self.push()
+                        return
+                    if info["mode"] in ("outages", "forward"):
+                        out = raw  # точний текст
+                    else:
+                        out = self._render(scfg.get("template") or "{text}", raw, name)
+                    ok = await self._send(out, arrived, media=media)
+                    if ok:
+                        self._remember(raw, name)
+                outcome, detail = self._res(ok)
+                self.emit(src_label, kind, outcome, detail, first)
+            finally:
+                self.st["pending"] -= 1
+        else:
+            # Режим «Тривоги» (chernivetskaODA тощо):
+            # якщо є ключові слова тривоги/відбою/загроз — точний дубль тексту в призначення
+            items = parse_source_message(raw)
+            if not items:
+                self.emit(src_label, "Повідомлення", "ignore", "не стосується тривог", first)
+            else:
+                self.st["pending"] += 1
+                self.push()
+                try:
+                    async with self.proc_lock:  # type: ignore[union-attr]
+                        for item in items:
+                            kind, outcome, detail = await self._handle_item(item, arrived, original_text=raw)
+                            self.emit(src_label, kind, outcome, detail, first)
+                finally:
+                    self.st["pending"] -= 1
+        self.push()
+
+
+OUTCOME_TEXT = {"sent": "Надіслано", "skip": "Пропущено", "error": "Помилка",
+                "ignore": "Ігнор", "ok": "Виконано"}
